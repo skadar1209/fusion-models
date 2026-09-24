@@ -1,0 +1,676 @@
+# -*- coding: utf-8 -*-
+# ============================================================
+# 训练/加载：ADA + CAT + XGB + LGBM + 动态融合 FusionNet
+# 1) 保存融合模型评估指标（Train/Test：R2/MSE/RMSE/MAE/MAPE/Pearson/Huber）到 CSV
+# 2) 保存融合模型拟合效果图（Observation vs Prediction，Train/Test）
+# 3) 读取你已生成的 5010 个虚拟点（7特征） -> 融合模型预测 IICE_pred_fusion
+#    保存：VirtualPoints_5010_FUSION_pred.csv
+# 4) 保存“5010个点全在一张图里”：AC vs IICE_pred_fusion
+# 5) （可选）若虚拟点CSV含 panel/x_feat/y_feat -> 输出6张论文风格离散热图（pcolormesh + contour插值仅显示）
+#
+# 数据：C:\Users\X\Desktop\机器学习（新）\ADA8.csv
+# 输出：C:\Users\X\Desktop\机器学习（新）\reproduce_TableS3_Fig5_results\
+#
+# 依赖：
+#   pip install xgboost catboost lightgbm torch scipy scikit-learn matplotlib pandas numpy
+# ============================================================
+
+import os
+import glob
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import KNNImputer
+from sklearn.metrics import (
+    mean_squared_error, r2_score,
+    mean_absolute_error, mean_absolute_percentage_error
+)
+from scipy import stats
+import joblib
+
+from sklearn.ensemble import AdaBoostRegressor
+from sklearn.tree import DecisionTreeRegressor
+from xgboost import XGBRegressor
+
+# ---- CatBoost ----
+try:
+    from catboost import CatBoostRegressor
+    CAT_OK = True
+except Exception as e:
+    CAT_OK = False
+    print("[Warn] CatBoost 导入失败，将跳过 CatBoost：", e)
+
+# ---- LightGBM ----
+try:
+    from lightgbm import LGBMRegressor
+    LGB_OK = True
+except Exception as e:
+    LGB_OK = False
+    print("[Warn] LightGBM 导入失败，将跳过 LightGBM：", e)
+
+# ---- PyTorch ----
+try:
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    TORCH_OK = True
+except Exception as e:
+    TORCH_OK = False
+    print("[Warn] PyTorch 导入失败：无法训练 FusionNet：", e)
+
+# ---- contour 插值（仅显示）----
+try:
+    from scipy.interpolate import RectBivariateSpline
+    SPLINE_OK = True
+except Exception:
+    SPLINE_OK = False
+
+
+# =========================
+# 0) 路径
+# =========================
+DATA_PATH = r"C:\Users\X\Desktop\机器学习（新）\ADA8.csv"
+BASE_DIR = os.path.dirname(DATA_PATH)
+OUT_DIR = os.path.join(BASE_DIR, "reproduce_TableS3_Fig5_results")
+os.makedirs(OUT_DIR, exist_ok=True)
+
+FONT_PATH = os.path.join(BASE_DIR, "timesbd.ttf")
+if os.path.exists(FONT_PATH):
+    font_prop = fm.FontProperties(fname=FONT_PATH)
+    matplotlib.rcParams["font.family"] = font_prop.get_name()
+else:
+    matplotlib.rcParams["font.family"] = "Times New Roman"
+
+LOAD_EXISTING = True
+
+ADA_PATH       = os.path.join(BASE_DIR, "ADA_ICE_model.pkl")
+CAT_PATH       = os.path.join(BASE_DIR, "CAT_ICE_model.pkl")
+XGB_PATH       = os.path.join(BASE_DIR, "XGB_ICE_model.pkl")
+LGB_PATH       = os.path.join(BASE_DIR, "LGBM_ICE_model.pkl")
+SCALER_PATH    = os.path.join(BASE_DIR, "ICE_scaler.pkl")
+FUSION_PT_PATH = os.path.join(BASE_DIR, "DynamicFusionNet_ada_cat_xgb_lgbm.pt")
+
+
+# =========================
+# 1) 特征 & 目标列
+# =========================
+features = ["TEM", "AZ", "IS", "DC", "AC", "RP", "BBMJ"]
+target_col = "IICE"
+
+
+# =========================
+# 2) 你“虚拟点5010”CSV 的路径（优先自动寻找）
+#    如果自动找不到，把下面这行改成你的真实路径即可
+# =========================
+VIRTUAL_POINTS_PATH = ""  # 例如：r"C:\Users\X\Desktop\机器学习（新）\reproduce_TableS3_Fig5_results\xxxx.csv"
+
+def auto_find_virtual_csv(out_dir: str):
+    cands = []
+    patterns = [
+        os.path.join(out_dir, "*discrete*points*.csv"),
+        os.path.join(out_dir, "*virtual*points*.csv"),
+        os.path.join(out_dir, "*Fig5*points*.csv"),
+        os.path.join(out_dir, "*.csv"),
+    ]
+    for p in patterns:
+        cands.extend(glob.glob(p))
+    cands = list(dict.fromkeys(cands))
+
+    best = None
+    best_score = -1
+    for fp in cands:
+        try:
+            df_tmp = pd.read_csv(fp)
+            n = len(df_tmp)
+            score = 0
+            name = os.path.basename(fp).lower()
+            if "discrete" in name: score += 5
+            if "virtual" in name: score += 5
+            if "points" in name: score += 3
+            if "fig5" in name: score += 2
+            if 4000 <= n <= 20000: score += 3
+            if all(col in df_tmp.columns for col in features): score += 10
+            if score > best_score:
+                best_score = score
+                best = fp
+        except Exception:
+            continue
+    return best
+
+
+# =========================
+# 3) 工具函数
+# =========================
+def huber_loss_np(y_true, y_pred, delta=1.0):
+    err = y_true - y_pred
+    abs_err = np.abs(err)
+    quad = np.minimum(abs_err, delta)
+    return np.mean(0.5 * quad**2 + delta * (abs_err - quad))
+
+def metrics_dict(y_true, y_pred):
+    mse = mean_squared_error(y_true, y_pred)
+    rmse = float(np.sqrt(mse))
+    pr, pp = stats.pearsonr(np.array(y_true), np.array(y_pred))
+    return {
+        "R2": r2_score(y_true, y_pred),
+        "MSE": mse,
+        "RMSE": rmse,
+        "MAE": mean_absolute_error(y_true, y_pred),
+        "MAPE": mean_absolute_percentage_error(y_true, y_pred),
+        "Pearson_r": pr,
+        "Pearson_p": pp,
+        "Huber(delta=1.0)": huber_loss_np(np.array(y_true), np.array(y_pred), delta=1.0),
+    }
+
+def centers_to_edges(vals):
+    vals = np.asarray(vals, dtype=float)
+    if len(vals) == 1:
+        return np.array([vals[0] - 0.5, vals[0] + 0.5], dtype=float)
+    d = np.diff(vals)
+    edges = np.empty(len(vals) + 1, dtype=float)
+    edges[1:-1] = vals[:-1] + d / 2.0
+    edges[0] = vals[0] - d[0] / 2.0
+    edges[-1] = vals[-1] + d[-1] / 2.0
+    return edges
+
+def interpolate_for_contour(x_vals, y_vals, Z, fine_n=300):
+    x_vals = np.asarray(x_vals, float)
+    y_vals = np.asarray(y_vals, float)
+    Z = np.asarray(Z, float)
+
+    if (not SPLINE_OK) or (len(x_vals) < 2) or (len(y_vals) < 2):
+        return x_vals, y_vals, Z
+
+    nx = len(x_vals)
+    ny = len(y_vals)
+    kx = min(3, nx - 1)
+    ky = min(3, ny - 1)
+    if kx < 1 or ky < 1:
+        return x_vals, y_vals, Z
+
+    # spline 输入Z需要转置：Z.T
+    spline = RectBivariateSpline(x_vals, y_vals, Z.T, kx=kx, ky=ky)
+
+    x_f = np.linspace(x_vals.min(), x_vals.max(), fine_n)
+    y_f = np.linspace(y_vals.min(), y_vals.max(), fine_n)
+    Z_f = spline(x_f, y_f).T
+    return x_f, y_f, Z_f
+
+
+def plot_fusion_fit(y_train, y_train_pred, y_test, y_test_pred, save_path):
+    """
+    预测拟合效果图：Observation vs Prediction（Train/Test）
+    """
+    y_train = np.asarray(y_train).ravel()
+    y_train_pred = np.asarray(y_train_pred).ravel()
+    y_test = np.asarray(y_test).ravel()
+    y_test_pred = np.asarray(y_test_pred).ravel()
+
+    all_y = np.concatenate([y_train, y_test])
+    all_p = np.concatenate([y_train_pred, y_test_pred])
+    vmin = float(min(all_y.min(), all_p.min()))
+    vmax = float(max(all_y.max(), all_p.max()))
+    pad = 0.02 * (vmax - vmin + 1e-12)
+    vmin -= pad
+    vmax += pad
+
+    mtr = metrics_dict(y_train, y_train_pred)
+    mte = metrics_dict(y_test, y_test_pred)
+
+    fig = plt.figure(figsize=(8.4, 7.6))
+    ax = fig.add_axes([0.12, 0.12, 0.83, 0.80])
+
+    ax.scatter(y_train, y_train_pred, s=22, alpha=0.75, label=f"Train (R2={mtr['R2']:.3f}, RMSE={mtr['RMSE']:.3g})")
+    ax.scatter(y_test,  y_test_pred,  s=22, alpha=0.75, label=f"Test  (R2={mte['R2']:.3f}, RMSE={mte['RMSE']:.3g})")
+
+    ax.plot([vmin, vmax], [vmin, vmax], "k--", lw=1.6)
+    ax.set_xlim(vmin, vmax)
+
+
+    ax.set_xlabel("Observation (IICE)", fontsize=16, fontweight="bold")
+    ax.set_ylabel("Prediction (FUSION)", fontsize=16, fontweight="bold")
+    ax.set_title("FUSION Model Fit: Observation vs Prediction", fontsize=15, fontweight="bold")
+
+    ax.tick_params(direction="in", length=6, width=1.2, labelsize=12)
+    ax.minorticks_on()
+    ax.tick_params(which="minor", direction="in", length=3, width=1.0)
+    for sp in ax.spines.values():
+        sp.set_linewidth(1.3)
+
+    ax.legend(frameon=False, fontsize=11, loc="best")
+
+    plt.savefig(save_path, dpi=600, bbox_inches="tight")
+    plt.close()
+    print("[Done] Saved fusion fit plot ->", save_path)
+
+
+# =========================
+# 4) 读取原始数据 + KNN填补
+# =========================
+df = pd.read_csv(DATA_PATH)
+non_numeric_columns = df.select_dtypes(exclude=[np.number]).columns
+numeric_df = df.drop(columns=non_numeric_columns).dropna(axis=1, how="all")
+
+imputer = KNNImputer(n_neighbors=1)
+numeric_df = pd.DataFrame(imputer.fit_transform(numeric_df), columns=numeric_df.columns)
+df = pd.concat([numeric_df, df[non_numeric_columns].reset_index(drop=True)], axis=1)
+
+missing_cols = [c for c in (features + [target_col]) if c not in df.columns]
+if missing_cols:
+    raise ValueError("ADA8.csv 缺少列：{}".format(missing_cols))
+
+X = df[features].copy()
+y = df[target_col].copy()
+print("[Info] Original data shape:", X.shape)
+
+
+# =========================
+# 5) 划分 + 标准化
+# =========================
+SEED_SPLIT = 8
+TEST_SIZE = 0.2
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=TEST_SIZE, random_state=SEED_SPLIT
+)
+
+if LOAD_EXISTING and os.path.exists(SCALER_PATH):
+    scaler = joblib.load(SCALER_PATH)
+    print("[Info] Loaded scaler:", SCALER_PATH)
+else:
+    scaler = StandardScaler().fit(X_train)
+    joblib.dump(scaler, SCALER_PATH)
+    print("[Done] Saved scaler:", SCALER_PATH)
+
+X_train_std = scaler.transform(X_train)
+X_test_std  = scaler.transform(X_test)
+
+
+# =========================
+# 6) 4个基模型：ADA / CAT / XGB / LGBM
+# =========================
+seed = 5
+
+def build_ada(seed=5):
+    base = DecisionTreeRegressor(
+        max_depth=4,
+        min_samples_split=2,
+        min_samples_leaf=3,
+        random_state=seed
+    )
+    try:
+        return AdaBoostRegressor(
+            estimator=base,
+            n_estimators=500,
+            learning_rate=0.1,
+            loss="square",
+            random_state=seed
+        )
+    except TypeError:
+        return AdaBoostRegressor(
+            base_estimator=base,
+            n_estimators=500,
+            learning_rate=0.1,
+            loss="square",
+            random_state=seed
+        )
+
+def build_cat(seed=5):
+    return CatBoostRegressor(
+        loss_function="RMSE",
+        n_estimators=1000,
+        depth=4,
+        learning_rate=0.01,
+        random_state=seed,
+        verbose=0
+    )
+
+def build_xgb(seed=5):
+    return XGBRegressor(
+        objective="reg:squarederror",
+        n_estimators=1800,
+        max_depth=4,
+        learning_rate=0.002,
+        subsample=1.0,
+        colsample_bytree=1.0,
+        random_state=seed,
+        n_jobs=-1,
+        tree_method="hist"
+    )
+
+def build_lgbm(seed=5):
+    return LGBMRegressor(
+        n_estimators=1500,
+        max_depth=-1,
+        num_leaves=31,
+        learning_rate=0.01,
+        subsample=1.0,
+        colsample_bytree=1.0,
+        random_state=seed,
+        n_jobs=-1
+    )
+
+# ADA
+if LOAD_EXISTING and os.path.exists(ADA_PATH):
+    ada_reg = joblib.load(ADA_PATH)
+    print("[Info] Loaded ADA:", ADA_PATH)
+else:
+    ada_reg = build_ada(seed)
+    ada_reg.fit(X_train_std, y_train)
+    joblib.dump(ada_reg, ADA_PATH)
+    print("[Done] Trained+Saved ADA:", ADA_PATH)
+
+# XGB
+if LOAD_EXISTING and os.path.exists(XGB_PATH):
+    xgb_reg = joblib.load(XGB_PATH)
+    print("[Info] Loaded XGB:", XGB_PATH)
+else:
+    xgb_reg = build_xgb(seed)
+    xgb_reg.fit(X_train_std, y_train)
+    joblib.dump(xgb_reg, XGB_PATH)
+    print("[Done] Trained+Saved XGB:", XGB_PATH)
+
+# CAT
+cat_reg = None
+if CAT_OK:
+    if LOAD_EXISTING and os.path.exists(CAT_PATH):
+        cat_reg = joblib.load(CAT_PATH)
+        print("[Info] Loaded CAT:", CAT_PATH)
+    else:
+        cat_reg = build_cat(seed)
+        cat_reg.fit(X_train_std, y_train)
+        joblib.dump(cat_reg, CAT_PATH)
+        print("[Done] Trained+Saved CAT:", CAT_PATH)
+else:
+    print("[Warn] CAT 不可用，融合将跳过 CAT。")
+
+# LGBM
+lgbm_reg = None
+if LGB_OK:
+    if LOAD_EXISTING and os.path.exists(LGB_PATH):
+        lgbm_reg = joblib.load(LGB_PATH)
+        print("[Info] Loaded LGBM:", LGB_PATH)
+    else:
+        lgbm_reg = build_lgbm(seed)
+        lgbm_reg.fit(X_train_std, y_train)
+        joblib.dump(lgbm_reg, LGB_PATH)
+        print("[Done] Trained+Saved LGBM:", LGB_PATH)
+else:
+    print("[Warn] LGBM 不可用，融合将跳过 LGBM。")
+
+
+# =========================
+# 7) 动态融合 FusionNet
+# =========================
+
+if cat_reg is not None:
+    base_models.append(("CAT", cat_reg))
+base_models.append(("XGB", xgb_reg))
+if lgbm_reg is not None:
+    base_models.append(("LGBM", lgbm_reg))
+
+MODEL_NAMES = [n for n, _ in base_models]
+M = len(MODEL_NAMES)
+
+if not TORCH_OK:
+    raise RuntimeError("你要求用“动态融合模型”预测，但当前环境 PyTorch 不可用。请先安装 torch。")
+
+class DynamicFusionNet(nn.Module):
+    def __init__(self, in_dim, hidden_dim=24):
+        super().__init__()
+        self.fc1 = nn.Linear(in_dim, hidden_dim)
+        self.act = nn.ReLU()
+        self.fc2 = nn.Linear(hidden_dim, in_dim)
+
+    def forward(self, preds):
+        h = self.act(self.fc1(preds))
+        scores = self.fc2(h)
+        w = torch.softmax(scores, dim=1)
+        fused = (w * preds).sum(dim=1)
+        return fused, w
+
+fusion_net = DynamicFusionNet(M, hidden_dim=24)
+
+# 训练输入：训练集上各基模型预测
+train_pred_list = [mdl.predict(X_train_std) for _, mdl in base_models]
+train_preds = np.vstack(train_pred_list).T  # (N_train, M)
+X_fuse_train = torch.tensor(train_preds, dtype=torch.float32)
+y_train_t = torch.tensor(y_train.values, dtype=torch.float32)
+
+crit = nn.SmoothL1Loss()
+opt = optim.Adam(fusion_net.parameters(), lr=1e-3, weight_decay=1e-4)
+
+if LOAD_EXISTING and os.path.exists(FUSION_PT_PATH):
+    fusion_net.load_state_dict(torch.load(FUSION_PT_PATH, map_location="cpu"))
+    print("[Info] Loaded FusionNet:", FUSION_PT_PATH)
+else:
+    fusion_net.train()
+    for ep in range(600):
+        opt.zero_grad()
+        pred, _ = fusion_net(X_fuse_train)
+        loss = crit(pred, y_train_t)
+        loss.backward()
+        opt.step()
+        if (ep + 1) % 150 == 0:
+            print(f"[Fusion] Epoch {ep+1}/600 | loss={loss.item():.6f}")
+    torch.save(fusion_net.state_dict(), FUSION_PT_PATH)
+    print("[Done] Saved FusionNet:", FUSION_PT_PATH)
+
+fusion_net.eval()
+
+def fusion_predict_from_raw(X_raw: pd.DataFrame, batch_size=200000) -> np.ndarray:
+    X_std = scaler.transform(X_raw[features].values)
+    N = X_std.shape[0]
+    out = np.zeros((N,), dtype=float)
+
+    for s in range(0, N, batch_size):
+        e = min(N, s + batch_size)
+        xs = X_std[s:e]
+
+        pred_list = [mdl.predict(xs) for _, mdl in base_models]
+        preds = np.vstack(pred_list).T  # (B, M)
+
+        with torch.no_grad():
+            fused, _ = fusion_net(torch.tensor(preds, dtype=torch.float32))
+        out[s:e] = fused.numpy()
+
+    return out
+
+
+# =========================
+# 8) 融合模型评估指标（保存 + 拟合图）
+# =========================
+ytr_fuse = fusion_predict_from_raw(X_train)
+yte_fuse = fusion_predict_from_raw(X_test)
+
+train_metrics = metrics_dict(y_train.values, ytr_fuse)
+test_metrics  = metrics_dict(y_test.values,  yte_fuse)
+
+# 保存：基模型 + 融合
+rows = []
+def add_row(tag, y_true, y_pred):
+    d = metrics_dict(np.array(y_true), np.array(y_pred))
+    d["model"] = tag
+    rows.append(d)
+
+for name, mdl in base_models:
+    add_row(f"{name}_train", y_train, mdl.predict(X_train_std))
+    add_row(f"{name}_test",  y_test,  mdl.predict(X_test_std))
+
+add_row("FUSION_train", y_train, ytr_fuse)
+
+metrics_df = pd.DataFrame(rows)
+metrics_path = os.path.join(OUT_DIR, "ICE_multi_model_metrics.csv")
+metrics_df.to_csv(metrics_path, index=False, encoding="utf-8-sig")
+print("\n[Done] Saved metrics ->", metrics_path)
+
+print("\n========================")
+print("✅ 融合模型 FUSION 指标（你关心的）")
+print("融合基模型顺序:", MODEL_NAMES)
+print("[Train]")
+for k, v in train_metrics.items():
+    print(f"  {k:14s}: {v:.6f}")
+print("[Test ]")
+for k, v in test_metrics.items():
+    print(f"  {k:14s}: {v:.6f}")
+print("========================\n")
+
+# ✅ 新增：融合模型拟合效果图
+fit_plot_path = os.path.join(OUT_DIR, "Fusion_Fit_Obs_vs_Pred.png")
+plot_fusion_fit(y_train.values, ytr_fuse, y_test.values, yte_fuse, fit_plot_path)
+
+
+# =========================
+# 9) 读取你已生成的 5010 个虚拟点，并做融合预测
+# =========================
+if not VIRTUAL_POINTS_PATH:
+    VIRTUAL_POINTS_PATH = auto_find_virtual_csv(OUT_DIR)
+
+if (not VIRTUAL_POINTS_PATH) or (not os.path.exists(VIRTUAL_POINTS_PATH)):
+    raise FileNotFoundError(
+        "没有在 OUT_DIR 找到你的“5010虚拟点CSV”。\n"
+        "请把代码里 VIRTUAL_POINTS_PATH 改成你的虚拟点csv路径。"
+    )
+
+vp = pd.read_csv(VIRTUAL_POINTS_PATH)
+print("[Info] Virtual points file:", VIRTUAL_POINTS_PATH)
+print("[Info] Virtual points shape:", vp.shape)
+
+miss = [c for c in features if c not in vp.columns]
+if miss:
+    raise ValueError(f"你的虚拟点CSV缺少特征列：{miss}，必须包含 {features}")
+
+vp["IICE_pred_fusion"] = fusion_predict_from_raw(vp)
+
+out_vp_path = os.path.join(OUT_DIR, "VirtualPoints_5010_FUSION_pred.csv")
+vp.to_csv(out_vp_path, index=False, encoding="utf-8-sig")
+print("[Done] Saved virtual points with fusion prediction ->", out_vp_path)
+print("[Info] Predicted IICE count =", len(vp), "(应为5010)")
+
+
+# =========================
+# 10) 你要的图：5010个虚拟点全部画在一张图里
+#     x=AC, y=IICE_pred_fusion
+# =========================
+fig = plt.figure(figsize=(9.4, 7.2))
+ax = fig.add_axes([0.12, 0.12, 0.83, 0.82])
+
+if "panel" in vp.columns:
+    for p in ["(a)", "(b)", "(c)", "(d)", "(e)", "(f)"]:
+
+            continue
+        ax.scatter(sub["AC"].values, sub["IICE_pred_fusion"].values, s=10, alpha=0.65, label=p)
+    ax.legend(frameon=False, fontsize=11, loc="best")
+else:
+    ax.scatter(vp["AC"].values, vp["IICE_pred_fusion"].values, s=10, alpha=0.65)
+
+ax.set_xlabel("AC (virtual points)", fontsize=16, fontweight="bold")
+ax.set_ylabel("Predicted IICE (FUSION)", fontsize=16, fontweight="bold")
+ax.set_title(f"All Virtual Points (N={len(vp)}) - FUSION Prediction", fontsize=15, fontweight="bold")
+
+ax.tick_params(direction="in", length=6, width=1.2, labelsize=12)
+ax.minorticks_on()
+ax.tick_params(which="minor", direction="in", length=3, width=1.0)
+for sp in ax.spines.values():
+    sp.set_linewidth(1.3)
+
+scatter_path = os.path.join(OUT_DIR, "VirtualPoints_5010_AC_vs_IICEpred_FUSION.png")
+plt.savefig(scatter_path, dpi=600, bbox_inches="tight")
+plt.close()
+print("[Done] Saved plot (all 5010 points) ->", scatter_path)
+
+
+# =========================
+# 11) （可选）若虚拟点文件含 panel/x_feat/y_feat -> 输出6张论文风格离散热图
+# =========================
+if all(col in vp.columns for col in ["panel", "x_feat", "y_feat"]):
+    print("\n[Info] Detected panel/x_feat/y_feat columns -> will render 6 paper-style maps...")
+
+    global_vmin = float(vp["IICE_pred_fusion"].min())
+    global_vmax = float(vp["IICE_pred_fusion"].max())
+    cbar_ticks = np.linspace(global_vmin, global_vmax, 9)
+
+    def plot_panel_paper_style_discrete(panel, fx, fy, ylab, xlab, save_path):
+        sub = vp[(vp["panel"] == panel) & (vp["x_feat"] == fx) & (vp["y_feat"] == fy)].copy()
+        if len(sub) == 0:
+            return
+
+        x_vals = np.sort(sub[fx].unique())
+        y_vals = np.sort(sub[fy].unique())
+
+        Zmat = sub.pivot_table(index=fy, columns=fx, values="IICE_pred_fusion", aggfunc="mean")
+        Zmat = Zmat.reindex(index=y_vals, columns=x_vals)
+        Z = Zmat.values
+
+        x_edges = centers_to_edges(x_vals)
+        y_edges = centers_to_edges(y_vals)
+
+        fig = plt.figure(figsize=(7.6, 4.9))
+        ax = fig.add_axes([0.10, 0.14, 0.68, 0.78])
+
+        pm = ax.pcolormesh(
+            x_edges, y_edges, Z,
+            cmap="jet",
+            vmin=global_vmin, vmax=global_vmax,
+            shading="auto"
+        )
+
+        # contour（插值仅显示，不改变真实预测点）
+        x_f, y_f, Z_f = interpolate_for_contour(x_vals, y_vals, Z, fine_n=300)
+        ax.contour(
+            x_f, y_f, Z_f,
+            levels=np.linspace(global_vmin, global_vmax, 10),
+            colors="k", linewidths=0.35, alpha=0.35
+        )
+
+        ax.set_xlabel(xlab, fontsize=14, fontweight="bold")
+        ax.set_ylabel(ylab, fontsize=14, fontweight="bold")
+
+        ax.tick_params(direction="in", length=6, width=1.2, labelsize=12)
+        ax.minorticks_on()
+        ax.tick_params(which="minor", direction="in", length=3, width=1.0)
+        for sp in ax.spines.values():
+            sp.set_linewidth(1.3)
+
+        ax.text(0.01, 0.98, panel, transform=ax.transAxes,
+                ha="left", va="top", fontsize=14, fontweight="bold")
+
+        cax = fig.add_axes([0.82, 0.14, 0.04, 0.78])
+        cb = fig.colorbar(pm, cax=cax)
+        cb.ax.set_title("Prediction", fontsize=12, fontweight="bold", pad=8)
+        cb.set_ticks(cbar_ticks)
+        cb.ax.tick_params(direction="in", length=5, width=1.1, labelsize=11)
+        cb.outline.set_linewidth(1.2)
+        cb.ax.set_yticklabels([f"{t:.3f}" for t in cbar_ticks])
+
+        plt.savefig(save_path, dpi=600, bbox_inches="tight")
+        plt.close()
+
+    pairs = [
+        ("(a)", "AC", "RP",   "RP Range",        "AC Range"),
+        ("(b)", "AC", "AZ",   "AS Range (nm)",   "AC Range"),
+        ("(c)", "AC", "TEM",  "TEM Range",       "AC Range"),
+        ("(d)", "AC", "IS",   "IS Range",        "AC Range"),
+        ("(e)", "AC", "DC",   "DC Range",        "AC Range"),
+        ("(f)", "AC", "BBMJ", "BBMJ Range",      "AC Range"),
+    ]
+
+    for panel, fx, fy, ylab, xlab in pairs:
+        panel_id = panel.replace("(", "").replace(")", "")
+        save_name = os.path.join(OUT_DIR, f"Fig5_Virtual5010_paperStyle_{panel_id}_{fy}_vs_{fx}.png")
+        plot_panel_paper_style_discrete(panel, fx, fy, ylab, xlab, save_name)
+        print("[Done] Saved:", save_name)
+
+print("\n✅ 全部完成。输出目录：", OUT_DIR)
+print("融合基模型:", MODEL_NAMES)
+print("新增拟合图：Fusion_Fit_Obs_vs_Pred.png")
